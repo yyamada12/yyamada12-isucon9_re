@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -978,9 +979,31 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var waitGroup sync.WaitGroup
+
+	ssrMap := sync.Map{}
 	for _, v := range transactionEvidences {
 		transactionEvidenceMap[v.ItemID] = v
+		if v.ID > 0 {
+			waitGroup.Add(1)
+			go func(reserveID string) {
+				defer waitGroup.Done()
+
+				ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+					ReserveID: reserveID,
+				})
+				if err != nil {
+					log.Print(err)
+					outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+					tx.Rollback()
+					return
+				}
+				ssrMap.Store(reserveID, ssr)
+			}(v.ReserveID)
+		}
 	}
+
+	waitGroup.Wait()
 
 	itemDetails := []ItemDetail{}
 	for _, item := range items {
@@ -1024,20 +1047,12 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 
 		transactionEvidence, ok := transactionEvidenceMap[item.ID]
 
-		if ok {
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: transactionEvidence.ReserveID,
-			})
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				tx.Rollback()
-				return
-			}
+		if transactionEvidence.ID > 0 {
+			ssr, _ := ssrMap.Load(transactionEvidence.ReserveID)
 
 			itemDetail.TransactionEvidenceID = transactionEvidence.ID
 			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = ssr.Status
+			itemDetail.ShippingStatus = ssr.(*APIShipmentStatusRes).Status
 		}
 
 		itemDetails = append(itemDetails, itemDetail)
